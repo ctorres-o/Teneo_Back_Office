@@ -87,8 +87,23 @@ async function getAccessToken(sa: ServiceAccount): Promise<string> {
 interface PendingNotification {
   id: string;
   owner_id: string;
+  pet_id: string | null;
+  source_module: string | null;
+  source_id: string | null;
   title: string;
   message: string;
+}
+
+/** Bloque `data` del mensaje: la app lo usa para abrir lo que corresponde al
+ * tocar la notificación (ver services/notification_navigation.dart en la app).
+ * FCM exige que todos los valores de `data` sean texto, y no admite valores
+ * nulos: lo que falta simplemente no se envía. */
+function pushData(n: PendingNotification): Record<string, string> {
+  const data: Record<string, string> = { notification_id: n.id };
+  if (n.source_module) data.source_module = n.source_module;
+  if (n.source_id) data.source_id = n.source_id;
+  if (n.pet_id) data.pet_id = n.pet_id;
+  return data;
 }
 
 Deno.serve(async () => {
@@ -156,7 +171,7 @@ Deno.serve(async () => {
 
     const { data: pending, error } = await supabase
       .from("notifications")
-      .select("id, owner_id, title, message")
+      .select("id, owner_id, pet_id, source_module, source_id, title, message")
       .is("sent_at", null)
       .lte("trigger_date", new Date().toISOString())
       .returns<PendingNotification[]>();
@@ -226,6 +241,7 @@ Deno.serve(async () => {
               message: {
                 token,
                 notification: { title: n.title, body: n.message },
+                data: pushData(n),
               },
             }),
           },
