@@ -344,7 +344,11 @@ export async function decodeNotification(
 /** Texto corto y sin datos sensibles para registrar o devolver un error de Apple. */
 export function describeAppleError(e: unknown): string {
   if (e instanceof AppleApiError) return e.message;
-  if (e instanceof VerificationException)
-    return `La firma de Apple no se pudo verificar (código ${e.status})`;
+  if (e instanceof VerificationException) {
+    // La causa interna (si la hay) dice en qué paso falló: cadena de certificados, OCSP o la firma misma.
+    const cause =
+      e.cause instanceof Error ? `: ${e.cause.message.slice(0, 200)}` : "";
+    return `La firma de Apple no se pudo verificar (código ${e.status}${cause})`;
+  }
   return e instanceof Error ? e.message : String(e);
 }
