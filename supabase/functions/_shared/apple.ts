@@ -20,8 +20,73 @@ import {
 import { Buffer } from "node:buffer";
 import { APPLE_ROOT_CAS_BASE64 } from "./apple_roots.ts";
 import { AppleApiClient, AppleApiError } from "./apple_client.ts";
+import {
+  AppleJwsError,
+  type AppleJwsErrorKind,
+  verifyAppleJws,
+} from "./apple_jws.ts";
 
 export type AppleEnv = "production" | "sandbox";
+
+/** Motivo de rechazo de `verifyAppleJws` -> estado equivalente de la biblioteca (los mismos que usa ella). */
+const JWS_ERROR_STATUS: Record<AppleJwsErrorKind, VerificationStatus> = {
+  format: VerificationStatus.VERIFICATION_FAILURE,
+  chain_length: VerificationStatus.INVALID_CHAIN_LENGTH,
+  untrusted: VerificationStatus.VERIFICATION_FAILURE,
+  dates: VerificationStatus.INVALID_CERTIFICATE,
+  signature: VerificationStatus.VERIFICATION_FAILURE,
+};
+
+interface PayloadValidator<T> {
+  validate(obj: unknown): obj is T;
+}
+
+/**
+ * Verificador de la biblioteca de Apple con UN paso reemplazado: la verificación del JWS (cadena de certificados + firma).
+ * La biblioteca la hace con el `X509Certificate` de Node, que en las Edge Functions de Supabase está incompleto ("Not implemented"
+ * en `toString`, `raw`, ...). Aquí se hace con `apple_jws.ts` (jsrsasign + WebCrypto). Todo lo demás sigue siendo de la biblioteca:
+ * formato del contenido, bundle ID, entorno, identificador de la app.
+ */
+export class SupabaseSignedDataVerifier extends SignedDataVerifier {
+  constructor(
+    private readonly trustedRootsBase64: string[],
+    environment: Environment,
+    bundleId: string,
+    appAppleId?: number,
+  ) {
+    // `false`: sin consulta de revocación (OCSP). Ver apple_jws.ts.
+    super(
+      trustedRootsBase64.map((b64) => Buffer.from(b64, "base64")),
+      false,
+      environment,
+      bundleId,
+      appAppleId,
+    );
+  }
+
+  protected override async verifyJWT<T>(
+    jwt: string,
+    validator: PayloadValidator<T>,
+    _signedDateExtractor: (decodedJWT: T) => Date,
+  ): Promise<T> {
+    try {
+      const { payload } = await verifyAppleJws(jwt, this.trustedRootsBase64);
+      if (!validator.validate(payload)) {
+        throw new VerificationException(VerificationStatus.FAILURE);
+      }
+      return payload;
+    } catch (e) {
+      if (e instanceof VerificationException) throw e;
+      if (e instanceof AppleJwsError) {
+        throw new VerificationException(JWS_ERROR_STATUS[e.kind], e);
+      }
+      throw new VerificationException(
+        VerificationStatus.VERIFICATION_FAILURE,
+        e instanceof Error ? e : undefined,
+      );
+    }
+  }
+}
 
 /** Falta uno o más secretos: se nombra cuáles para poder arreglarlo sin adivinar. */
 export class AppleConfigError extends Error {}
@@ -89,10 +154,8 @@ function clientFor(env: AppleEnv): AppleApiClient {
 
 export function verifierFor(env: AppleEnv): SignedDataVerifier {
   const c = config();
-  const roots = APPLE_ROOT_CAS_BASE64.map((b64) => Buffer.from(b64, "base64"));
-  return new SignedDataVerifier(
-    roots,
-    true,
+  return new SupabaseSignedDataVerifier(
+    APPLE_ROOT_CAS_BASE64,
     appleEnvironment(env),
     c.bundleId,
     c.appId,

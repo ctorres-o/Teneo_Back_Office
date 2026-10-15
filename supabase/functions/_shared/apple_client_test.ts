@@ -8,13 +8,21 @@ import {
   signAppleToken,
 } from "./apple_client.ts";
 import {
+  SupabaseSignedDataVerifier,
   shouldTryOtherEnvironment,
   shouldTrySandboxVerifier,
 } from "./apple.ts";
 import {
+  Environment,
   VerificationException,
   VerificationStatus,
 } from "npm:@apple/app-store-server-library@3.1.0";
+import {
+  TEST_NOTIFICATION,
+  TEST_NOTIFICATION_LEAF_WITHOUT_APPLE_MARK,
+  TEST_ROOT,
+  TEST_TRANSACTION,
+} from "./apple_jws_fixtures.ts";
 
 function base64UrlToBytes(value: string): Uint8Array<ArrayBuffer> {
   const b64 = value.replace(/-/g, "+").replace(/_/g, "/");
@@ -248,5 +256,103 @@ Deno.test(
       false,
     );
     assertEquals(shouldTrySandboxVerifier(new Error("otro")), false);
+  },
+);
+
+// --- El verificador de la biblioteca de Apple, con la verificación de certificados reemplazada (SupabaseSignedDataVerifier) ---
+const BUNDLE = "com.netglobal.teneo";
+const verifierIn = (env: Environment, bundle = BUNDLE) =>
+  new SupabaseSignedDataVerifier([TEST_ROOT], env, bundle, 123456789);
+
+async function statusOf(
+  promise: Promise<unknown>,
+): Promise<VerificationStatus> {
+  const error = await assertRejects(() => promise, VerificationException);
+  return error.status;
+}
+
+Deno.test(
+  "el verificador con el reemplazo decodifica un aviso y una transacción de sandbox bien firmados",
+  async () => {
+    const verifier = verifierIn(Environment.SANDBOX);
+    const notification =
+      await verifier.verifyAndDecodeNotification(TEST_NOTIFICATION);
+    assertEquals(String(notification.notificationType), "TEST");
+    assertEquals(
+      notification.notificationUUID,
+      "11111111-2222-3333-4444-555555555555",
+    );
+    const transaction =
+      await verifier.verifyAndDecodeTransaction(TEST_TRANSACTION);
+    assertEquals(transaction.productId, "teneo.pro.monthly");
+  },
+);
+
+Deno.test(
+  "un aviso de sandbox lo rechaza el verificador de producción de forma que se reintenta como sandbox",
+  async () => {
+    const status = await statusOf(
+      verifierIn(Environment.PRODUCTION).verifyAndDecodeNotification(
+        TEST_NOTIFICATION,
+      ),
+    );
+    assert(
+      shouldTrySandboxVerifier(new VerificationException(status)),
+      `un aviso de sandbox debe poder reintentarse como sandbox (estado ${status})`,
+    );
+  },
+);
+
+Deno.test("el verificador sigue exigiendo el bundle ID de la app", async () => {
+  assertEquals(
+    await statusOf(
+      verifierIn(
+        Environment.SANDBOX,
+        "com.otra.app",
+      ).verifyAndDecodeNotification(TEST_NOTIFICATION),
+    ),
+    VerificationStatus.INVALID_APP_IDENTIFIER,
+  );
+});
+
+Deno.test(
+  "el verificador rechaza un aviso sin la marca de Apple, con la raíz equivocada o alterado",
+  async () => {
+    const sandbox = verifierIn(Environment.SANDBOX);
+    assertEquals(
+      await statusOf(
+        sandbox.verifyAndDecodeNotification(
+          TEST_NOTIFICATION_LEAF_WITHOUT_APPLE_MARK,
+        ),
+      ),
+      VerificationStatus.VERIFICATION_FAILURE,
+    );
+    const otherRoot = new SupabaseSignedDataVerifier(
+      [],
+      Environment.SANDBOX,
+      BUNDLE,
+      123456789,
+    );
+    assertEquals(
+      await statusOf(otherRoot.verifyAndDecodeNotification(TEST_NOTIFICATION)),
+      VerificationStatus.VERIFICATION_FAILURE,
+    );
+    const [h, , s] = TEST_NOTIFICATION.split(".");
+    const forgedPayload = btoa(
+      JSON.stringify({
+        notificationType: "REFUND",
+        notificationUUID: "x",
+        data: { environment: "Sandbox", bundleId: BUNDLE },
+      }),
+    )
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    assertEquals(
+      await statusOf(
+        sandbox.verifyAndDecodeNotification(`${h}.${forgedPayload}.${s}`),
+      ),
+      VerificationStatus.VERIFICATION_FAILURE,
+    );
   },
 );
