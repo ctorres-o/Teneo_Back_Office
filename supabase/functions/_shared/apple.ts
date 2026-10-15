@@ -188,18 +188,35 @@ async function stateIn(
 }
 
 /** Estado actual de una compra de Apple. Prueba producción y, si Apple no la conoce, sandbox (TestFlight y cuentas de prueba). */
+/**
+ * ¿Hay que probar con el otro entorno de Apple? Sí si Apple responde 404 (la transacción no existe en este entorno) o 401.
+ * El 401 importa mientras la app no esté publicada: en PRODUCCIÓN Apple rechaza la credencial (la misma que en sandbox sí acepta),
+ * y las compras de TestFlight viven en sandbox.
+ */
+export function shouldTryOtherEnvironment(e: unknown): boolean {
+  return (
+    e instanceof AppleApiError && (e.httpStatus === 404 || e.httpStatus === 401)
+  );
+}
+
 export async function fetchSubscriptionState(
   transactionId: string,
 ): Promise<AppleSubscriptionState> {
+  let lastError: unknown;
   for (const env of ["production", "sandbox"] as AppleEnv[]) {
     try {
       return await stateIn(env, transactionId);
     } catch (e) {
-      // 404 = esa transacción no existe en este entorno: se prueba el siguiente.
-      if (e instanceof AppleApiError && e.httpStatus === 404) continue;
+      if (shouldTryOtherEnvironment(e)) {
+        lastError = e;
+        continue;
+      }
       throw e;
     }
   }
+  // Rechazada en los dos entornos: si fue por credenciales (401) se informa así y no como "compra desconocida".
+  if (lastError instanceof AppleApiError && lastError.httpStatus === 401)
+    throw lastError;
   throw new AppleNotFoundError("Apple no reconoce esa compra.");
 }
 
@@ -213,6 +230,20 @@ export interface DecodedNotification {
 }
 
 /** Verifica la firma de un aviso de Apple y lo decodifica. Prueba producción y, si el aviso es de sandbox, sandbox. */
+/**
+ * ¿El aviso rechazado por el verificador de PRODUCCIÓN puede ser de sandbox? Sí si dice entorno inválido o identificador de app
+ * inválido: el verificador de producción compara primero el identificador de la app, y los avisos de sandbox no lo traen,
+ * así que un aviso de sandbox llega como INVALID_APP_IDENTIFIER y no como INVALID_ENVIRONMENT. El verificador de sandbox
+ * vuelve a exigir el bundle ID y el entorno, así que un aviso ajeno sigue rechazado.
+ */
+export function shouldTrySandboxVerifier(e: unknown): boolean {
+  return (
+    e instanceof VerificationException &&
+    (e.status === VerificationStatus.INVALID_ENVIRONMENT ||
+      e.status === VerificationStatus.INVALID_APP_IDENTIFIER)
+  );
+}
+
 export async function decodeNotification(
   signedPayload: string,
 ): Promise<DecodedNotification> {
@@ -224,10 +255,7 @@ export async function decodeNotification(
         signedPayload,
       );
   } catch (e) {
-    if (
-      e instanceof VerificationException &&
-      e.status === VerificationStatus.INVALID_ENVIRONMENT
-    ) {
+    if (shouldTrySandboxVerifier(e)) {
       env = "sandbox";
       payload =
         await verifierFor("sandbox").verifyAndDecodeNotification(signedPayload);

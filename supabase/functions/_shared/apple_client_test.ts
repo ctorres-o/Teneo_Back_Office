@@ -7,6 +7,14 @@ import {
   pemToDer,
   signAppleToken,
 } from "./apple_client.ts";
+import {
+  shouldTryOtherEnvironment,
+  shouldTrySandboxVerifier,
+} from "./apple.ts";
+import {
+  VerificationException,
+  VerificationStatus,
+} from "npm:@apple/app-store-server-library@3.1.0";
 
 function base64UrlToBytes(value: string): Uint8Array<ArrayBuffer> {
   const b64 = value.replace(/-/g, "+").replace(/_/g, "/");
@@ -185,5 +193,60 @@ Deno.test(
     );
     assertEquals(error.httpStatus, 401);
     assertEquals(error.errorCode, null);
+  },
+);
+
+Deno.test(
+  "se prueba el otro entorno con 404 y con 401 (producción rechaza mientras la app no esté publicada), no con otros errores",
+  () => {
+    assertEquals(
+      shouldTryOtherEnvironment(new AppleApiError(404, 4040010, null)),
+      true,
+    );
+    assertEquals(
+      shouldTryOtherEnvironment(new AppleApiError(401, null, null)),
+      true,
+    );
+    assertEquals(
+      shouldTryOtherEnvironment(new AppleApiError(500, null, null)),
+      false,
+    );
+    assertEquals(
+      shouldTryOtherEnvironment(new AppleApiError(429, null, null)),
+      false,
+    );
+    assertEquals(shouldTryOtherEnvironment(new Error("otro")), false);
+  },
+);
+
+Deno.test(
+  "un aviso rechazado por el verificador de producción por entorno o por identificador de app se prueba como sandbox",
+  () => {
+    assertEquals(
+      shouldTrySandboxVerifier(
+        new VerificationException(VerificationStatus.INVALID_ENVIRONMENT),
+      ),
+      true,
+    );
+    assertEquals(
+      shouldTrySandboxVerifier(
+        new VerificationException(VerificationStatus.INVALID_APP_IDENTIFIER),
+      ),
+      true,
+    );
+    // una firma inválida o un certificado inválido NO se reintenta: es un aviso falso
+    assertEquals(
+      shouldTrySandboxVerifier(
+        new VerificationException(VerificationStatus.VERIFICATION_FAILURE),
+      ),
+      false,
+    );
+    assertEquals(
+      shouldTrySandboxVerifier(
+        new VerificationException(VerificationStatus.INVALID_CERTIFICATE),
+      ),
+      false,
+    );
+    assertEquals(shouldTrySandboxVerifier(new Error("otro")), false);
   },
 );
