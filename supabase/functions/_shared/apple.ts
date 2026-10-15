@@ -10,8 +10,6 @@
 //
 // Regla de fondo (MATRIZ_DE_PLANES.md, principio 2): el estado y la fecha de término salen de Apple, nunca de la app.
 import {
-  APIException,
-  AppStoreServerAPIClient,
   AutoRenewStatus,
   Environment,
   SignedDataVerifier,
@@ -21,6 +19,7 @@ import {
 } from "npm:@apple/app-store-server-library@3.1.0";
 import { Buffer } from "node:buffer";
 import { APPLE_ROOT_CAS_BASE64 } from "./apple_roots.ts";
+import { AppleApiClient, AppleApiError } from "./apple_client.ts";
 
 export type AppleEnv = "production" | "sandbox";
 
@@ -74,14 +73,17 @@ function appleEnvironment(env: AppleEnv): Environment {
   return env === "production" ? Environment.PRODUCTION : Environment.SANDBOX;
 }
 
-function clientFor(env: AppleEnv): AppStoreServerAPIClient {
+// El cliente de la biblioteca de Apple firma con `jsonwebtoken` y falla en las Edge Functions (ver apple_client.ts): se usa el propio.
+function clientFor(env: AppleEnv): AppleApiClient {
   const c = config();
-  return new AppStoreServerAPIClient(
-    c.privateKey,
-    c.keyId,
-    c.issuerId,
-    c.bundleId,
-    appleEnvironment(env),
+  return new AppleApiClient(
+    {
+      privateKey: c.privateKey,
+      keyId: c.keyId,
+      issuerId: c.issuerId,
+      bundleId: c.bundleId,
+    },
+    env,
   );
 }
 
@@ -194,7 +196,7 @@ export async function fetchSubscriptionState(
       return await stateIn(env, transactionId);
     } catch (e) {
       // 404 = esa transacción no existe en este entorno: se prueba el siguiente.
-      if (e instanceof APIException && e.httpStatusCode === 404) continue;
+      if (e instanceof AppleApiError && e.httpStatus === 404) continue;
       throw e;
     }
   }
@@ -250,8 +252,7 @@ export async function decodeNotification(
 
 /** Texto corto y sin datos sensibles para registrar o devolver un error de Apple. */
 export function describeAppleError(e: unknown): string {
-  if (e instanceof APIException)
-    return `Apple respondió ${e.httpStatusCode}${e.apiError ? ` (${e.apiError})` : ""}`;
+  if (e instanceof AppleApiError) return e.message;
   if (e instanceof VerificationException)
     return `La firma de Apple no se pudo verificar (código ${e.status})`;
   return e instanceof Error ? e.message : String(e);

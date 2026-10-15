@@ -1,0 +1,189 @@
+// Pruebas del cliente de Apple. Se ejecutan con:  deno test supabase/functions/_shared/apple_client_test.ts
+// No usan la red ni claves reales: la clave se genera aquí y las respuestas de Apple son simuladas.
+import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1";
+import {
+  AppleApiClient,
+  AppleApiError,
+  pemToDer,
+  signAppleToken,
+} from "./apple_client.ts";
+
+function base64UrlToBytes(value: string): Uint8Array<ArrayBuffer> {
+  const b64 = value.replace(/-/g, "+").replace(/_/g, "/");
+  const binary = atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4));
+  const out = new Uint8Array(new ArrayBuffer(binary.length));
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+async function makeKeyPair() {
+  const pair = await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["sign", "verify"],
+  );
+  const der = new Uint8Array(
+    await crypto.subtle.exportKey("pkcs8", pair.privateKey),
+  );
+  let binary = "";
+  for (const b of der) binary += String.fromCharCode(b);
+  const body = btoa(binary)
+    .match(/.{1,64}/g)!
+    .join("\n");
+  return {
+    pair,
+    pem: `-----BEGIN PRIVATE KEY-----\n${body}\n-----END PRIVATE KEY-----\n`,
+  };
+}
+
+const creds = (privateKey: string) => ({
+  privateKey,
+  keyId: "ABC123DEFG",
+  issuerId: "69a6de7e-0000-0000-0000-5b8c86461234",
+  bundleId: "com.netglobal.teneo",
+});
+
+Deno.test(
+  "pemToDer acepta la clave con líneas BEGIN/END, sin ellas y con \\n escritos como texto",
+  async () => {
+    const { pem } = await makeKeyPair();
+    const a = pemToDer(pem);
+    const b = pemToDer(pem.replace(/-----[A-Z ]+-----/g, ""));
+    const c = pemToDer(pem.trim().replace(/\n/g, "\\n"));
+    assert(a.length > 60);
+    assertEquals(a, b);
+    assertEquals(a, c);
+  },
+);
+
+Deno.test(
+  "la credencial es un JWT ES256 con los datos de Apple y su firma es válida",
+  async () => {
+    const { pair, pem } = await makeKeyPair();
+    const token = await signAppleToken(creds(pem), 1_700_000_000);
+    const [h, p, s] = token.split(".");
+    const header = JSON.parse(new TextDecoder().decode(base64UrlToBytes(h)));
+    const payload = JSON.parse(new TextDecoder().decode(base64UrlToBytes(p)));
+    assertEquals(header, { alg: "ES256", kid: "ABC123DEFG", typ: "JWT" });
+    assertEquals(payload, {
+      iss: "69a6de7e-0000-0000-0000-5b8c86461234",
+      iat: 1_700_000_000,
+      exp: 1_700_000_300,
+      aud: "appstoreconnect-v1",
+      bid: "com.netglobal.teneo",
+    });
+    const signature = base64UrlToBytes(s);
+    assertEquals(signature.length, 64); // r || s, el formato de un JWT
+    const ok = await crypto.subtle.verify(
+      { name: "ECDSA", hash: "SHA-256" },
+      pair.publicKey,
+      signature,
+      new TextEncoder().encode(`${h}.${p}`),
+    );
+    assert(ok, "la firma debe verificarse con la clave pública");
+  },
+);
+
+Deno.test(
+  "una clave que no es P-256 se rechaza en vez de firmar mal",
+  async () => {
+    const pair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-384" },
+      true,
+      ["sign", "verify"],
+    );
+    const der = new Uint8Array(
+      await crypto.subtle.exportKey("pkcs8", pair.privateKey),
+    );
+    let binary = "";
+    for (const b of der) binary += String.fromCharCode(b);
+    await assertRejects(() =>
+      signAppleToken(
+        creds(
+          `-----BEGIN PRIVATE KEY-----\n${btoa(binary)}\n-----END PRIVATE KEY-----`,
+        ),
+      ),
+    );
+  },
+);
+
+Deno.test(
+  "pide la transacción al servidor de Apple del entorno correcto, con la credencial",
+  async () => {
+    const { pem } = await makeKeyPair();
+    const seen: { url: string; auth: string | null }[] = [];
+    const fakeFetch = ((url: string | URL | Request, init?: RequestInit) => {
+      seen.push({
+        url: String(url),
+        auth: new Headers(init?.headers).get("Authorization"),
+      });
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ signedTransactionInfo: "jws.de.prueba" }),
+          { status: 200 },
+        ),
+      );
+    }) as typeof fetch;
+
+    const sandbox = new AppleApiClient(creds(pem), "sandbox", fakeFetch);
+    const prod = new AppleApiClient(creds(pem), "production", fakeFetch);
+    assertEquals(
+      (await sandbox.getTransactionInfo("1000000000000001"))
+        .signedTransactionInfo,
+      "jws.de.prueba",
+    );
+    await prod.getAllSubscriptionStatuses("1000000000000001");
+
+    assertEquals(
+      seen[0].url,
+      "https://api.storekit-sandbox.itunes.apple.com/inApps/v1/transactions/1000000000000001",
+    );
+    assertEquals(
+      seen[1].url,
+      "https://api.storekit.itunes.apple.com/inApps/v1/subscriptions/1000000000000001",
+    );
+    assert(seen[0].auth?.startsWith("Bearer ey"));
+  },
+);
+
+Deno.test(
+  "un 404 de Apple se informa como AppleApiError con su código, para poder probar el otro entorno",
+  async () => {
+    const { pem } = await makeKeyPair();
+    const fakeFetch = (() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            errorCode: 4040010,
+            errorMessage: "Transaction id not found.",
+          }),
+          { status: 404 },
+        ),
+      )) as typeof fetch;
+    const client = new AppleApiClient(creds(pem), "production", fakeFetch);
+    const error = await assertRejects(
+      () => client.getTransactionInfo("1"),
+      AppleApiError,
+    );
+    assertEquals(error.httpStatus, 404);
+    assertEquals(error.errorCode, 4040010);
+  },
+);
+
+Deno.test(
+  "un 401 (credenciales rechazadas) y una respuesta que no es JSON también se informan",
+  async () => {
+    const { pem } = await makeKeyPair();
+    const fakeFetch = (() =>
+      Promise.resolve(
+        new Response("no autorizado", { status: 401 }),
+      )) as typeof fetch;
+    const client = new AppleApiClient(creds(pem), "sandbox", fakeFetch);
+    const error = await assertRejects(
+      () => client.getTransactionInfo("1"),
+      AppleApiError,
+    );
+    assertEquals(error.httpStatus, 401);
+    assertEquals(error.errorCode, null);
+  },
+);
